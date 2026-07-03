@@ -1,0 +1,6 @@
+# face-api.js model weights go here (not committed — large binaries).
+# Download from: https://github.com/justadudewhohacks/face-api.js/tree/master/weights
+# Required for FaceCapture:
+#   tiny_face_detector_model-*
+#   face_landmark_68_model-*
+#   face_recognition_model-*
