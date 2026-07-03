@@ -11,6 +11,10 @@ export function ValidationFlow() {
 
   async function handleBiometric({ faceDescriptor, livenessPassed }) {
     setError(null);
+    if (!faceDescriptor) {
+      setError({ error: 'descriptor_missing', reason: 'Liveness OK pero faltan los modelos face-api (public/models). Sin descriptor no se puede registrar la prueba.' });
+      return;
+    }
     setBusy(true);
     try {
       const res = await validate({ address, faceDescriptor, livenessPassed, faceDistance: 0 });

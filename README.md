@@ -1,15 +1,24 @@
 # poh-frontend
 
 React + Vite frontend for the hybrid Proof of Humanity system. Wallet connection via
-**Wagmi**, biometric capture via **face-api.js** (MediaPipe liveness planned).
+**Wagmi**, liveness via **MediaPipe FaceLandmarker**, identity descriptor via **face-api.js**.
 
 ## Flow
 
 1. Connect an Ethereum wallet (MetaMask / injected).
-2. Start the webcam, capture a face, run a basic liveness proxy.
-3. Send the face descriptor + liveness result to `poh-backend`, which registers the proof
+2. Start the webcam. **Liveness challenge**: the user must blink twice — MediaPipe
+   blendshapes (`eyeBlinkLeft/Right`) drive a blink state machine (`src/lib/liveness.js`).
+3. On liveness pass, capture the 128-d face descriptor with face-api.js.
+4. Send the descriptor + liveness result to `poh-backend`, which registers the proof
    on-chain and returns metrics.
-4. Verify humanity status on demand.
+5. Verify humanity status on demand.
+
+## Liveness (MediaPipe)
+
+`src/lib/liveness.js` wraps `FaceLandmarker` and exposes `LivenessDetector`, a stateful
+blink counter (extensible to a head-turn challenge via `requireHeadTurn`). The WASM runtime
+and `.task` model load from the official CDN by default; set `VITE_MEDIAPIPE_WASM_URL` and
+`VITE_FACE_LANDMARKER_MODEL_URL` to self-host them under `public/` for offline use.
 
 ## Setup
 
