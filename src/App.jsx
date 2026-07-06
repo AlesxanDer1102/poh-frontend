@@ -3,12 +3,41 @@ import { ValidationFlow } from './components/ValidationFlow.jsx';
 
 export function App() {
   return (
-    <main style={{ maxWidth: 640, margin: '2rem auto', fontFamily: 'system-ui, sans-serif' }}>
-      <h1>Proof of Humanity</h1>
-      <p>Sistema híbrido de validación de usuarios humanos sobre Ethereum Sepolia.</p>
-      <WalletConnect />
-      <hr style={{ margin: '1.5rem 0' }} />
-      <ValidationFlow />
-    </main>
+    <div className="app-shell">
+      <header className="navbar">
+        <div className="container navbar__inner">
+          <div className="brand">
+            <span className="brand__mark" aria-hidden="true">
+              ⬡
+            </span>
+            <span className="brand__name">
+              Proof of Humanity
+              <span className="brand__sub">Hybrid on-chain identity</span>
+            </span>
+          </div>
+          <WalletConnect />
+        </div>
+      </header>
+
+      <main className="container">
+        <section className="hero">
+          <span className="hero__eyebrow">
+            <span className="net-badge__dot" aria-hidden="true" />
+            Ethereum Sepolia · Testnet
+          </span>
+          <h1>Verify you are a unique human</h1>
+          <p>
+            A hybrid Proof of Humanity system: off-chain face verification and liveness,
+            registered as a tamper-proof proof on the Ethereum blockchain.
+          </p>
+        </section>
+
+        <ValidationFlow />
+      </main>
+
+      <footer className="footer">
+        Reference implementation · Hybrid Proof of Humanity on Blockchain
+      </footer>
+    </div>
   );
 }
