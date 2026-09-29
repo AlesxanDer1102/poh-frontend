@@ -3,39 +3,51 @@ import * as faceapi from 'face-api.js';
 import { getFaceLandmarker, LivenessDetector } from '../lib/liveness.js';
 
 const FACEAPI_MODEL_URL = '/models';
-const REQUIRED_BLINKS = 2;
+const SAMPLE_GAP_MS = 250; // pause between extra samples taken after the blinks
+const TIMEOUT_MARGIN_MS = 1000; // give up this long before the server's challenge window ends
 
 /** Human-readable presentation for each internal capture state. */
 const STATUS_META = {
   'loading-models': { label: 'Loading detection models…', variant: 'pill--busy' },
   ready: { label: 'Camera ready', variant: 'pill--info' },
+  'requesting-challenge': { label: 'Requesting challenge…', variant: 'pill--busy' },
   liveness: { label: 'Liveness check in progress', variant: 'pill--info' },
-  capturing: { label: 'Capturing biometric signature…', variant: 'pill--busy' },
   done: { label: 'Face captured', variant: 'pill--success' },
-  'no-face': { label: 'No face detected — try again', variant: 'pill--danger' },
+  timeout: { label: 'Challenge timed out — try again', variant: 'pill--danger' },
+  'camera-error': { label: 'Camera unavailable', variant: 'pill--danger' },
+  'challenge-error': { label: 'Could not get a challenge', variant: 'pill--danger' },
   'mediapipe-missing': { label: 'Liveness engine failed to load', variant: 'pill--danger' },
   'descriptor-models-missing': { label: 'Identity models missing', variant: 'pill--warning' },
 };
 
+const RESTARTABLE = ['done', 'timeout', 'camera-error', 'challenge-error'];
+
 /**
- * Biometric capture with a real MediaPipe liveness challenge.
+ * Biometric capture with a real MediaPipe liveness challenge, bound to the identity capture.
  *
  * Flow:
  *   1. Load face-api models (identity descriptor) + MediaPipe FaceLandmarker (liveness).
- *   2. Start webcam.
- *   3. Liveness challenge: user must blink `REQUIRED_BLINKS` times; MediaPipe blendshapes
- *      drive a blink state machine over the video stream.
- *   4. On pass, capture the 128-d face descriptor with face-api.
- *   5. Emit { faceDescriptor, livenessPassed: true }.
+ *   2. On start, ask the parent for a server challenge (`getChallenge`): the number of
+ *      blinks, the sample count range and the time window all come from the server.
+ *   3. Start the webcam. MediaPipe blendshapes drive a blink state machine over the video
+ *      stream; DURING that same loop, face-api descriptors are sampled from the same stream:
+ *      one before the first blink and one right after each blink (so at least one lies
+ *      between blinks), plus extra samples if needed to reach the server's minimum.
+ *   4. Emit { samples: [{ descriptor, t }] }, `t` = ms since challenge start.
+ *
+ * Client-side liveness only: the server can check the samples are consistent and
+ * time-plausible, but cannot tell a live face from an injected video stream.
  */
-export function FaceCapture({ onResult, onStatus }) {
+export function FaceCapture({ getChallenge, onResult, onStatus }) {
   const videoRef = useRef(null);
   const rafRef = useRef(0);
-  const detectorRef = useRef(null);
+  const runRef = useRef(0); // id of the active challenge run; bumping it cancels the loop
   const landmarkerRef = useRef(null);
 
   const [status, setStatus] = useState('loading-models');
   const [blinks, setBlinks] = useState(0);
+  const [requiredBlinks, setRequiredBlinks] = useState(0);
+  const [sampleCount, setSampleCount] = useState(0);
   const [faceApiReady, setFaceApiReady] = useState(false);
   const [mediapipeReady, setMediapipeReady] = useState(false);
 
@@ -70,6 +82,7 @@ export function FaceCapture({ onResult, onStatus }) {
 
     return () => {
       cancelled = true;
+      runRef.current += 1;
       cancelAnimationFrame(rafRef.current);
       stopStream(videoRef.current);
     };
@@ -80,63 +93,117 @@ export function FaceCapture({ onResult, onStatus }) {
       setStatus('mediapipe-missing');
       return;
     }
-    const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-    if (!videoRef.current) return;
-    videoRef.current.srcObject = stream;
-    await videoRef.current.play();
-
-    detectorRef.current = new LivenessDetector({ requiredBlinks: REQUIRED_BLINKS });
-    setBlinks(0);
-    setStatus('liveness');
-    loop();
-  }
-
-  function loop() {
-    const video = videoRef.current;
-    const landmarker = landmarkerRef.current;
-    const detector = detectorRef.current;
-    if (!video || !landmarker || !detector) return;
-
-    if (video.readyState >= 2) {
-      const result = landmarker.detectForVideo(video, performance.now());
-      const state = detector.update(result);
-      setBlinks(state.blinks);
-
-      if (state.passed) {
-        setStatus('capturing');
-        cancelAnimationFrame(rafRef.current);
-        captureDescriptor();
-        return;
-      }
-    }
-    rafRef.current = requestAnimationFrame(loop);
-  }
-
-  async function captureDescriptor() {
     if (!faceApiReady) {
-      // Liveness proven; identity models missing. Report so the flow can decide.
+      // Without face-api there is nothing to sample; let the parent explain it.
       setStatus('descriptor-models-missing');
-      onResult({ faceDescriptor: null, livenessPassed: true });
+      onResult({ samples: null });
       return;
     }
-    const detection = await faceapi
-      .detectSingleFace(videoRef.current, new faceapi.TinyFaceDetectorOptions())
-      .withFaceLandmarks()
-      .withFaceDescriptor();
 
+    const runId = ++runRef.current;
+    const active = () => runRef.current === runId;
+
+    setStatus('requesting-challenge');
+    let challenge;
+    try {
+      challenge = await getChallenge();
+    } catch {
+      if (active()) setStatus('challenge-error'); // the parent reports the details
+      return;
+    }
+    if (!active()) return;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      if (!videoRef.current || !active()) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      videoRef.current.srcObject = stream;
+      await videoRef.current.play();
+    } catch {
+      if (active()) setStatus('camera-error');
+      return;
+    }
+
+    setBlinks(0);
+    setSampleCount(0);
+    setRequiredBlinks(challenge.liveness.requiredBlinks);
+    setStatus('liveness');
+
+    const samples = await runChallenge(challenge.liveness, active);
     stopStream(videoRef.current);
+    if (!active()) return;
 
-    if (!detection) {
-      setStatus('no-face');
+    if (!samples) {
+      setStatus('timeout');
       return;
     }
     setStatus('done');
-    onResult({ faceDescriptor: Array.from(detection.descriptor), livenessPassed: true });
+    onResult({ samples });
+  }
+
+  /**
+   * Blink loop + descriptor sampling on the same video stream.
+   * @returns {Promise<Array<{descriptor:number[], t:number}> | null>} null on timeout/cancel
+   */
+  async function runChallenge(params, active) {
+    const video = videoRef.current;
+    const landmarker = landmarkerRef.current;
+    const detector = new LivenessDetector({ requiredBlinks: params.requiredBlinks });
+    const deadline = params.maxDurationMs - TIMEOUT_MARGIN_MS;
+    const start = performance.now();
+    const samples = [];
+    let sampledAtBlinks = -1; // blink count when the last sample was taken
+
+    const timedOut = () => performance.now() - start > deadline;
+
+    /** Take one descriptor from the current frame; false if no face was found. */
+    const takeSample = async () => {
+      const t = Math.round(performance.now() - start);
+      const detection = await faceapi
+        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions())
+        .withFaceLandmarks()
+        .withFaceDescriptor();
+      if (!detection) return false;
+      const prev = samples.length ? samples[samples.length - 1].t : -1;
+      samples.push({ descriptor: Array.from(detection.descriptor), t: Math.max(t, prev + 1) });
+      setSampleCount(samples.length);
+      return true;
+    };
+
+    // Phase 1: blinks. Sample once with open eyes at the start and once after every blink.
+    while (active()) {
+      if (timedOut()) return null;
+      if (video.readyState >= 2) {
+        const state = detector.update(landmarker.detectForVideo(video, performance.now()));
+        setBlinks(state.blinks);
+
+        const due = state.facePresent && detector.eyesOpen && state.blinks > sampledAtBlinks;
+        if (due && samples.length < params.maxSamples && (await takeSample())) {
+          sampledAtBlinks = state.blinks;
+        }
+        if (state.passed) break;
+      }
+      await nextFrame(rafRef);
+    }
+    if (!active()) return null;
+
+    // Phase 2: top up to the server's minimum, and make sure the last sample is not earlier
+    // than the minimum challenge duration.
+    const target = Math.min(params.maxSamples, Math.max(params.minSamples, 1 + params.requiredBlinks));
+    while (active() && (samples.length < target || samples[samples.length - 1].t < params.minDurationMs)) {
+      if (timedOut()) return null;
+      await sleep(SAMPLE_GAP_MS);
+      if (samples.length >= params.maxSamples) samples.pop(); // replace the last one with a later one
+      await takeSample();
+    }
+    return active() ? samples : null;
   }
 
   const meta = STATUS_META[status] ?? { label: status, variant: '' };
-  const isLive = status === 'liveness' || status === 'capturing';
-  const busy = status === 'loading-models' || status === 'liveness' || status === 'capturing';
+  const isLive = status === 'liveness';
+  const busy = status === 'loading-models' || status === 'requesting-challenge' || status === 'liveness';
 
   return (
     <div>
@@ -172,9 +239,11 @@ export function FaceCapture({ onResult, onStatus }) {
 
       {status === 'liveness' && (
         <div className="blink">
-          <span className="blink__label">Blink {REQUIRED_BLINKS} times, looking at the camera</span>
+          <span className="blink__label">
+            Blink {requiredBlinks} times, looking at the camera ({sampleCount} sample{sampleCount === 1 ? '' : 's'} captured)
+          </span>
           <span className="blink__dots">
-            {Array.from({ length: REQUIRED_BLINKS }).map((_, i) => (
+            {Array.from({ length: requiredBlinks }).map((_, i) => (
               <span key={i} className={`blink__dot${i < blinks ? ' is-on' : ''}`} />
             ))}
           </span>
@@ -191,12 +260,15 @@ export function FaceCapture({ onResult, onStatus }) {
           onClick={startChallenge}
           disabled={busy}
         >
-          {status === 'done' || status === 'no-face' ? 'Restart' : 'Start verification'}
+          {RESTARTABLE.includes(status) ? 'Restart' : 'Start verification'}
         </button>
       </div>
     </div>
   );
 }
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const nextFrame = (rafRef) => new Promise((resolve) => (rafRef.current = requestAnimationFrame(resolve)));
 
 function stopStream(video) {
   const stream = video?.srcObject;

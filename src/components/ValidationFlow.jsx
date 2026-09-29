@@ -1,9 +1,52 @@
-import { useState } from 'react';
-import { useAccount } from 'wagmi';
+import { useRef, useState } from 'react';
+import { useAccount, useSignMessage } from 'wagmi';
 import { FaceCapture } from './FaceCapture.jsx';
-import { validate, verify } from '../api.js';
+import { requestChallenge, validate, verify } from '../api.js';
 
 const EXPLORER = 'https://sepolia.etherscan.io';
+
+/** User-facing text for backend error codes (`error` field). */
+const ERROR_MESSAGES = {
+  rate_limited: 'Too many requests from your network. Please wait a minute and try again.',
+  nonce_expired: 'The challenge expired. Press Restart to begin a new verification.',
+  nonce_invalid: 'This challenge was already used or is unknown. Press Restart to begin a new verification.',
+  message_mismatch: 'The signed message does not match the challenge. Press Restart to try again.',
+  invalid_signature: 'The wallet signature could not be verified for this address.',
+  duplicate_human: 'This person is already registered under a different wallet. One human can hold only one proof.',
+  already_registered: 'This wallet already holds a humanity proof.',
+  db_unavailable: 'The backend database is unavailable. Try again later.',
+  signature_rejected: 'You rejected the signature request in your wallet.',
+};
+
+/** User-facing text for `validation_failed` reasons. */
+const REASON_MESSAGES = {
+  inconsistent_samples:
+    'The face captured during the challenge was not consistent. Keep the same face in frame and try again.',
+  samples_count_out_of_range: 'Not enough face samples were captured. Please try again.',
+  invalid_descriptor: 'The face data was malformed. Please try again.',
+  descriptor_out_of_range: 'The face data was malformed. Please try again.',
+  invalid_timestamps: 'The challenge timing was invalid. Please try again.',
+  timestamps_out_of_window: 'The challenge was completed too fast or too slowly. Please try again.',
+  invalid_samples: 'The face data was malformed. Please try again.',
+};
+
+/** Normalise any thrown error into the { error, reason } shape ErrorCard renders. */
+function describeError(err) {
+  const data = err.data ?? {};
+  const rejected = err.name === 'UserRejectedRequestError' || err.cause?.name === 'UserRejectedRequestError';
+  const code = rejected ? 'signature_rejected' : data.error ?? err.message ?? 'error';
+
+  let reason;
+  if (code === 'validation_failed') {
+    reason = REASON_MESSAGES[data.reason] ?? data.reason;
+  } else if (code === 'too_many_attempts') {
+    const minutes = Math.max(1, Math.ceil((data.retryAfterSec ?? 60) / 60));
+    reason = `Too many failed attempts for this address. Try again in about ${minutes} minute${minutes === 1 ? '' : 's'}.`;
+  } else {
+    reason = ERROR_MESSAGES[code] ?? data.reason ?? err.shortMessage ?? err.message;
+  }
+  return { error: code, reason };
+}
 
 function truncate(value, head = 10, tail = 8) {
   if (!value || value.length <= head + tail) return value;
@@ -177,30 +220,61 @@ function Step({ index, label, state }) {
 
 export function ValidationFlow() {
   const { address, isConnected } = useAccount();
+  const { signMessageAsync } = useSignMessage();
+  const challengeRef = useRef(null);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
-  const [busy, setBusy] = useState(false);
+  const [phase, setPhase] = useState(null); // null | 'signing' | 'registering'
   const [captureStatus, setCaptureStatus] = useState('loading-models');
+  const busy = phase !== null;
 
-  async function handleBiometric({ faceDescriptor, livenessPassed }) {
+  // Step 1 of the flow: FaceCapture asks for the server challenge (SIWE message + liveness
+  // parameters) right before it starts the camera. Errors are shown here and re-thrown so
+  // FaceCapture aborts.
+  async function getChallenge() {
     setError(null);
     setResult(null);
-    if (!faceDescriptor) {
+    try {
+      const challenge = await requestChallenge(address);
+      challengeRef.current = challenge;
+      return challenge;
+    } catch (err) {
+      setError(describeError(err));
+      throw err;
+    }
+  }
+
+  // Step 2: samples were captured during the liveness challenge; sign the server's message
+  // to prove wallet ownership, then submit everything.
+  async function handleBiometric({ samples }) {
+    setError(null);
+    setResult(null);
+    if (!samples) {
       setError({
         error: 'descriptor_missing',
         reason:
-          'Liveness passed but the face-api models are missing (public/models). No descriptor means the proof cannot be registered.',
+          'The face-api models are missing (public/models), so no face samples can be captured. The proof cannot be registered.',
       });
       return;
     }
-    setBusy(true);
+    const challenge = challengeRef.current;
+    setPhase('signing');
     try {
-      const res = await validate({ address, faceDescriptor, livenessPassed, faceDistance: 0 });
+      const signature = await signMessageAsync({ message: challenge.message });
+      setPhase('registering');
+      const res = await validate({
+        address,
+        message: challenge.message,
+        signature,
+        nonce: challenge.nonce,
+        samples,
+      });
       setResult(res);
     } catch (err) {
-      setError(err.data ?? { error: err.message });
+      setError(describeError(err));
     } finally {
-      setBusy(false);
+      setPhase(null);
+      challengeRef.current = null;
     }
   }
 
@@ -209,7 +283,7 @@ export function ValidationFlow() {
     try {
       setResult(await verify(address));
     } catch (err) {
-      setError(err.data ?? { error: err.message });
+      setError(describeError(err));
     }
   }
 
@@ -238,16 +312,16 @@ export function ValidationFlow() {
           <div>
             <h2 className="card__title">Face verification &amp; liveness</h2>
             <p className="card__hint">
-              A quick blink challenge proves you are a live person, then your biometric
-              signature is registered on-chain.
+              A quick blink challenge proves you are a live person, you sign a message to prove
+              you own this wallet, then your proof is registered on-chain.
             </p>
-            <FaceCapture onResult={handleBiometric} onStatus={setCaptureStatus} />
+            <FaceCapture getChallenge={getChallenge} onResult={handleBiometric} onStatus={setCaptureStatus} />
           </div>
 
           {busy && (
             <span className="pill pill--info pill--busy">
               <span className="pill__dot" />
-              Registering proof on-chain…
+              {phase === 'signing' ? 'Waiting for your wallet signature…' : 'Registering proof on-chain…'}
             </span>
           )}
 
