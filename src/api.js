@@ -1,4 +1,4 @@
-const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:4000';
+const API_URL = import.meta.env?.VITE_API_URL ?? 'http://localhost:4000';
 
 /** Fetch JSON; on a non-2xx response throw an Error carrying `data`, `status` and Retry-After. */
 async function request(path, options, fallbackError) {
@@ -31,9 +31,18 @@ export function requestChallenge(address) {
 /**
  * POST /api/validate — send the signed SIWE message and the descriptor samples captured
  * during the liveness challenge; the server registers the proof on-chain.
+ * In semaphore issuance mode `identityCommitment` (decimal string) is required: the validators
+ * admit it to the HumanityIssuer group. Omit it in legacy mode.
  */
-export function validate({ address, message, signature, nonce, samples }) {
-  return request('/api/validate', postJson({ address, message, signature, nonce, samples }), 'validate_failed');
+export function validate({ address, message, signature, nonce, samples, identityCommitment }) {
+  const body = { address, message, signature, nonce, samples };
+  if (identityCommitment !== undefined) body.identityCommitment = identityCommitment;
+  return request('/api/validate', postJson(body), 'validate_failed');
+}
+
+/** GET /health — backend status; `issuanceMode` is 'semaphore' | 'legacy'. */
+export function getHealth() {
+  return request('/health', undefined, 'health_failed');
 }
 
 /** GET /api/verify/:address — read verification status. */

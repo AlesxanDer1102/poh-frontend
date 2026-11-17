@@ -24,3 +24,6 @@ public/models/*
 Thumbs.db
 .idea/
 .vscode/
+
+# Semaphore circuit artifacts (npm run artifacts)
+public/semaphore/

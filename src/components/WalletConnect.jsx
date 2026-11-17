@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useAccount, useConnect, useDisconnect } from 'wagmi';
 import { injected } from 'wagmi/connectors';
+import { chain } from '../wagmi.js';
 
 function shortAddress(addr) {
   return `${addr.slice(0, 6)}…${addr.slice(-4)}`;
@@ -27,7 +28,7 @@ export function WalletConnect() {
       <div className="wallet-cluster">
         <span className="net-badge">
           <span className="net-badge__dot" aria-hidden="true" />
-          Sepolia
+          {chain.name}
         </span>
         <span className="account-chip">
           <span className="account-chip__avatar" aria-hidden="true" />

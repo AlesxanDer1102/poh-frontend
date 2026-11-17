@@ -1,9 +1,14 @@
 import { useRef, useState } from 'react';
-import { useAccount, useSignMessage } from 'wagmi';
+import { useAccount, usePublicClient, useSignMessage } from 'wagmi';
 import { FaceCapture } from './FaceCapture.jsx';
 import { requestChallenge, validate, verify } from '../api.js';
+import { appConfig } from '../config.js';
+import { useHolderIdentity } from '../context/HolderIdentity.jsx';
+import { useIssuanceMode } from '../hooks/useIssuanceMode.js';
+import { isMember } from '../lib/semaphore.js';
 
-const EXPLORER = 'https://sepolia.etherscan.io';
+const EXPLORER = appConfig.explorerUrl;
+const explorerLink = (kind, value) => (EXPLORER && value ? `${EXPLORER}/${kind}/${value}` : undefined);
 
 /** User-facing text for backend error codes (`error` field). */
 const ERROR_MESSAGES = {
@@ -13,7 +18,8 @@ const ERROR_MESSAGES = {
   message_mismatch: 'The signed message does not match the challenge. Press Restart to try again.',
   invalid_signature: 'The wallet signature could not be verified for this address.',
   duplicate_human: 'This person is already registered under a different wallet. One human can hold only one proof.',
-  already_registered: 'This wallet already holds a humanity proof.',
+  already_registered: 'This wallet or identity already holds a humanity proof.',
+  invalid_commitment: 'The holder identity commitment was rejected by the server. Reload the page and try again.',
   db_unavailable: 'The backend database is unavailable. Try again later.',
   signature_rejected: 'You rejected the signature request in your wallet.',
 };
@@ -107,6 +113,62 @@ function Metrics({ metrics }) {
 }
 
 function ResultCard({ result }) {
+  // Semaphore membership check (see checkStatus)
+  if ('member' in result) {
+    return result.member ? (
+      <div className="result result--ok">
+        <div className="result__head">
+          <div className="result__icon">✓</div>
+          <div>
+            <div className="result__title">Verified human</div>
+            <div className="result__subtitle">Your holder identity is a member of the humanity group.</div>
+          </div>
+        </div>
+        <div className="result__body">
+          <CopyRow label="Identity commitment" value={result.commitment} />
+        </div>
+      </div>
+    ) : (
+      <div className="result result--warn">
+        <div className="result__head">
+          <div className="result__icon">!</div>
+          <div>
+            <div className="result__title">Not a member yet</div>
+            <div className="result__subtitle">This wallet's holder identity has not been admitted. Complete the verification above.</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Semaphore validate() response shape: the identity commitment was sent to the validators.
+  if ('identityCommitment' in result) {
+    const onChain = result.onChain === true;
+    return (
+      <div className={`result ${onChain ? 'result--ok' : 'result--warn'}`}>
+        <div className="result__head">
+          <div className="result__icon">{onChain ? '✓' : '!'}</div>
+          <div>
+            <div className="result__title">{onChain ? 'Admitted to the humanity group' : 'Validated off-chain'}</div>
+            <div className="result__subtitle">
+              {onChain
+                ? 'Your anonymous identity commitment was admitted on-chain. You can now delegate to AI agents.'
+                : result.note ?? 'Biometric validation passed but the commitment was not issued.'}
+            </div>
+          </div>
+        </div>
+        <div className="result__body">
+          <CopyRow label="Identity commitment" value={result.identityCommitment} />
+          {(result.txHashes ?? []).map((tx, i) => (
+            <CopyRow key={tx} label={`Approval tx ${i + 1}`} value={tx} href={explorerLink('tx', tx)} />
+          ))}
+          <Metrics metrics={result.metrics} />
+          <RawPayload data={result} />
+        </div>
+      </div>
+    );
+  }
+
   // verify() response shape
   if ('verified' in result && !('onChain' in result)) {
     if (result.verified) {
@@ -122,7 +184,7 @@ function ResultCard({ result }) {
           </div>
           <div className="result__body">
             <CopyRow label="Humanity hash" value={proof.humanityHash} />
-            <CopyRow label="Validator" value={proof.validator} href={proof.validator ? `${EXPLORER}/address/${proof.validator}` : undefined} />
+            <CopyRow label="Validator" value={proof.validator} href={explorerLink('address', proof.validator)} />
             {proof.timestamp ? (
               <div className="kv">
                 <span className="kv__key">Registered</span>
@@ -159,7 +221,7 @@ function ResultCard({ result }) {
           </div>
           <div className="result__subtitle">
             {onChain
-              ? 'Your proof is now permanently recorded on Ethereum Sepolia.'
+              ? 'Your proof is now permanently recorded on-chain.'
               : result.note ?? 'Biometric validation passed but the proof was not registered.'}
           </div>
         </div>
@@ -169,7 +231,7 @@ function ResultCard({ result }) {
         <CopyRow
           label="Transaction"
           value={result.txHash}
-          href={result.txHash ? `${EXPLORER}/tx/${result.txHash}` : undefined}
+          href={explorerLink('tx', result.txHash)}
         />
         <Metrics metrics={result.metrics} />
         <RawPayload data={result} />
@@ -221,6 +283,10 @@ function Step({ index, label, state }) {
 export function ValidationFlow() {
   const { address, isConnected } = useAccount();
   const { signMessageAsync } = useSignMessage();
+  const client = usePublicClient();
+  const mode = useIssuanceMode();
+  const semaphoreMode = mode === 'semaphore';
+  const { unlock } = useHolderIdentity();
   const challengeRef = useRef(null);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
@@ -235,10 +301,18 @@ export function ValidationFlow() {
     setError(null);
     setResult(null);
     try {
+      // Semaphore mode: derive the holder identity first (one wallet signature, kept in memory only)
+      // so the commitment is ready to be sent together with the face samples.
+      if (semaphoreMode) {
+        setPhase('deriving');
+        await unlock();
+        setPhase(null);
+      }
       const challenge = await requestChallenge(address);
       challengeRef.current = challenge;
       return challenge;
     } catch (err) {
+      setPhase(null);
       setError(describeError(err));
       throw err;
     }
@@ -262,12 +336,15 @@ export function ValidationFlow() {
     try {
       const signature = await signMessageAsync({ message: challenge.message });
       setPhase('registering');
+      const identity = semaphoreMode ? await unlock() : null;
       const res = await validate({
         address,
         message: challenge.message,
         signature,
         nonce: challenge.nonce,
         samples,
+        // Only the PUBLIC commitment leaves the browser; the identity secret never does.
+        ...(identity ? { identityCommitment: identity.commitment.toString() } : {}),
       });
       setResult(res);
     } catch (err) {
@@ -281,6 +358,12 @@ export function ValidationFlow() {
   async function checkStatus() {
     setError(null);
     try {
+      if (semaphoreMode) {
+        // No per-address proof exists in this mode: check the holder identity's group membership.
+        const identity = await unlock();
+        setResult({ member: await isMember(client, appConfig.chain, identity.commitment), commitment: identity.commitment.toString() });
+        return;
+      }
       setResult(await verify(address));
     } catch (err) {
       setError(describeError(err));
@@ -312,8 +395,9 @@ export function ValidationFlow() {
           <div>
             <h2 className="card__title">Face verification &amp; liveness</h2>
             <p className="card__hint">
-              A quick blink challenge proves you are a live person, you sign a message to prove
-              you own this wallet, then your proof is registered on-chain.
+              {semaphoreMode
+                ? 'You sign one message to derive your anonymous holder identity (it never leaves this browser), a quick blink challenge proves you are a live person, you sign a second message to prove you own this wallet, then only your identity commitment is admitted on-chain.'
+                : 'A quick blink challenge proves you are a live person, you sign a message to prove you own this wallet, then your proof is registered on-chain.'}
             </p>
             <FaceCapture getChallenge={getChallenge} onResult={handleBiometric} onStatus={setCaptureStatus} />
           </div>
@@ -321,7 +405,13 @@ export function ValidationFlow() {
           {busy && (
             <span className="pill pill--info pill--busy">
               <span className="pill__dot" />
-              {phase === 'signing' ? 'Waiting for your wallet signature…' : 'Registering proof on-chain…'}
+              {phase === 'deriving'
+                ? 'Waiting for the identity signature in your wallet…'
+                : phase === 'signing'
+                  ? 'Waiting for your wallet signature…'
+                  : semaphoreMode
+                    ? 'Admitting your identity on-chain…'
+                    : 'Registering proof on-chain…'}
             </span>
           )}
 

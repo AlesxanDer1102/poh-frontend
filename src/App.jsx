@@ -1,5 +1,7 @@
 import { WalletConnect } from './components/WalletConnect.jsx';
 import { ValidationFlow } from './components/ValidationFlow.jsx';
+import { DelegationPanel } from './components/delegation/DelegationPanel.jsx';
+import { chain } from './wagmi.js';
 
 export function App() {
   return (
@@ -23,7 +25,7 @@ export function App() {
         <section className="hero">
           <span className="hero__eyebrow">
             <span className="net-badge__dot" aria-hidden="true" />
-            Ethereum Sepolia · Testnet
+            {chain.name} · {chain.testnet ? 'Testnet' : 'Mainnet'}
           </span>
           <h1>Verify you are a unique human</h1>
           <p>
@@ -33,6 +35,7 @@ export function App() {
         </section>
 
         <ValidationFlow />
+        <DelegationPanel />
       </main>
 
       <footer className="footer">
